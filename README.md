@@ -1,5 +1,5 @@
 # tanzu-hub-cli
-Unofficial CLI for Tanzu Hub.
+Experimental CLI for Tanzu Hub. This is not part of the product and is not covered by global support, nor does it come with any future guarantee of updates.
 
 ## Usage
 ```
@@ -7,6 +7,7 @@ Unofficial CLI for Tanzu Hub.
 
 Available Commands:
   access-token    Generate an access token
+  alert           Manage observability alerts
   completion      Generate the autocompletion script for the specified shell
   foundation      Manage foundation attachment
   help            Help about any command
@@ -36,5 +37,4 @@ chmod +x th
 ```
 
 ## Roadmap
-- Declarative alert configuration
 - Declarative dashboard configuration
