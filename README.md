@@ -26,7 +26,7 @@ Use "th [command] --help" for more information about a command.
 ```
 
 ## Installation
-Downloads via the [releases page](https://github.com/laidbackware/tanzu-hub-cli/releases).
+Downloads via the [releases page](https://github.com/vmware-tanzu-labs/tanzu-hub-cli/releases).
 
 ## Linux/MacOS
 Move to a location in $PATH and make executable
