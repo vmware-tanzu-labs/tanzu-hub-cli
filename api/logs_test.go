@@ -463,3 +463,258 @@ func TestGetLogCount_GraphQLError(t *testing.T) {
 	_, err = gql.GetLogCount(context.Background(), "entity-1", LogInput{Namespace: "logs"})
 	assert.Error(t, err)
 }
+
+func TestGetAppNames(t *testing.T) {
+	t.Parallel()
+
+	var capturedInput map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == TokenEndpoint {
+			mockAuthEndpoint(w)
+			return
+		}
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		vars, _ := body["variables"].(map[string]any)
+		capturedInput, _ = vars["INPUT"].(map[string]any)
+
+		w.Header().Set("Content-Type", "application/json")
+		// Grouped COUNT returns one record per app name (unsorted, with dupes).
+		_, _ = w.Write([]byte(`{"data":{"observabilityQuery":{"queryLogs":{"pageInfo":{"hasNextPage":false,"endCursor":""},"logRecords":[
+			{"fields":[{"key":"appname","value":"gorouter"},{"key":"count","value":"500"}]},
+			{"fields":[{"key":"appname","value":"bbs"},{"key":"count","value":"300"}]},
+			{"fields":[{"key":"appname","value":"gorouter"},{"key":"count","value":"500"}]},
+			{"fields":[{"key":"appname","value":"rep"},{"key":"count","value":"100"}]}
+		]}}}}`))
+	}))
+	defer server.Close()
+
+	client, err := GetAccessToken("user", "pass", server.URL, true)
+	require.NoError(t, err)
+
+	gql := NewGraphQLClient(client, server.URL, true)
+	names, err := gql.GetAppNames(context.Background(), "entity-1", "2026-06-02T00:00:00Z", "2026-06-09T00:00:00Z")
+	require.NoError(t, err)
+
+	// Sorted by name and de-duplicated, with each name's count.
+	assert.Equal(t, []AppNameCount{
+		{Name: "bbs", Count: 300},
+		{Name: "gorouter", Count: 500},
+		{Name: "rep", Count: 100},
+	}, names)
+
+	// The query groups a COUNT aggregation on appname over the observability
+	// namespace using a queryTime range.
+	require.NotNil(t, capturedInput)
+	assert.Equal(t, "Observability", capturedInput["namespace"])
+	assert.Equal(t, []any{"appname"}, capturedInput["groupBy"])
+	agg, _ := capturedInput["aggregation"].(map[string]any)
+	require.NotNil(t, agg)
+	assert.Equal(t, "COUNT", agg["type"])
+	qt, _ := capturedInput["queryTime"].(map[string]any)
+	require.NotNil(t, qt)
+	assert.Equal(t, "2026-06-02T00:00:00Z", qt["startTime"])
+	assert.Equal(t, "2026-06-09T00:00:00Z", qt["endTime"])
+}
+
+func TestGetAppNames_Empty(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == TokenEndpoint {
+			mockAuthEndpoint(w)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":{"observabilityQuery":{"queryLogs":{"pageInfo":{"hasNextPage":false,"endCursor":""},"logRecords":[]}}}}`))
+	}))
+	defer server.Close()
+
+	client, err := GetAccessToken("user", "pass", server.URL, true)
+	require.NoError(t, err)
+
+	gql := NewGraphQLClient(client, server.URL, true)
+	names, err := gql.GetAppNames(context.Background(), "entity-1", "2026-06-02T00:00:00Z", "2026-06-09T00:00:00Z")
+	require.NoError(t, err)
+	assert.Empty(t, names)
+}
+
+func TestGetAppNames_GraphQLError(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == TokenEndpoint {
+			mockAuthEndpoint(w)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"errors":[{"message":"BAD_REQUEST"}]}`))
+	}))
+	defer server.Close()
+
+	client, err := GetAccessToken("user", "pass", server.URL, true)
+	require.NoError(t, err)
+
+	gql := NewGraphQLClient(client, server.URL, true)
+	_, err = gql.GetAppNames(context.Background(), "entity-1", "2026-06-02T00:00:00Z", "2026-06-09T00:00:00Z")
+	assert.Error(t, err)
+}
+
+func TestSeverityFilter(t *testing.T) {
+	t.Parallel()
+
+	// No severities → no filter.
+	assert.Nil(t, SeverityFilter(nil))
+
+	// Single severity → a leaf EQ filter.
+	single := SeverityFilter([]string{"error"})
+	require.NotNil(t, single)
+	assert.Equal(t, "severity", single.Field)
+	assert.Equal(t, "EQ", single.Operator)
+	assert.Equal(t, []any{"error"}, single.Values)
+	assert.Empty(t, single.Or)
+
+	// Multiple severities → an OR of leaf EQ filters.
+	multi := SeverityFilter([]string{"error", "info"})
+	require.NotNil(t, multi)
+	require.Len(t, multi.Or, 2)
+	assert.Equal(t, "severity", multi.Or[0].Field)
+	assert.Equal(t, "EQ", multi.Or[0].Operator)
+	assert.Equal(t, []any{"error"}, multi.Or[0].Values)
+	assert.Equal(t, []any{"info"}, multi.Or[1].Values)
+}
+
+func TestStreamLogs_SendsSeverityFilter(t *testing.T) {
+	t.Parallel()
+
+	var capturedInput map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == TokenEndpoint {
+			mockAuthEndpoint(w)
+			return
+		}
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		vars, _ := body["variables"].(map[string]any)
+		capturedInput, _ = vars["INPUT"].(map[string]any)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":{"observabilityQuery":{"queryLogs":{"pageInfo":{"hasNextPage":false,"endCursor":""},"logRecords":[]}}}}`))
+	}))
+	defer server.Close()
+
+	client, err := GetAccessToken("user", "pass", server.URL, true)
+	require.NoError(t, err)
+
+	gql := NewGraphQLClient(client, server.URL, true)
+	_, err = gql.QueryLogs(context.Background(), "entity-1", LogInput{
+		Namespace:   "logs",
+		QueryFilter: SeverityFilter([]string{"error", "info"}),
+	}, 0)
+	require.NoError(t, err)
+
+	// The queryFilter is forwarded as an OR of severity EQ leaves.
+	require.NotNil(t, capturedInput)
+	qf, _ := capturedInput["queryFilter"].(map[string]any)
+	require.NotNil(t, qf)
+	or, _ := qf["or"].([]any)
+	require.Len(t, or, 2)
+	leaf0, _ := or[0].(map[string]any)
+	assert.Equal(t, "severity", leaf0["field"])
+	assert.Equal(t, "EQ", leaf0["operator"])
+	assert.Equal(t, []any{"error"}, leaf0["values"])
+}
+
+func TestContainsFilter(t *testing.T) {
+	t.Parallel()
+
+	// Empty value → no filter.
+	assert.Nil(t, ContainsFilter("hostname", ""))
+
+	// A substring → a leaf CONTAINS filter on the named field.
+	f := ContainsFilter("hostname", "10.10.0.12")
+	require.NotNil(t, f)
+	assert.Equal(t, "hostname", f.Field)
+	assert.Equal(t, "CONTAINS", f.Operator)
+	assert.Equal(t, []any{"10.10.0.12"}, f.Values)
+}
+
+func TestAppNameFilter(t *testing.T) {
+	t.Parallel()
+
+	// Empty appname → no filter.
+	assert.Nil(t, AppNameFilter(""))
+
+	// A substring → a leaf CONTAINS filter.
+	f := AppNameFilter("gorouter")
+	require.NotNil(t, f)
+	assert.Equal(t, "appname", f.Field)
+	assert.Equal(t, "CONTAINS", f.Operator)
+	assert.Equal(t, []any{"gorouter"}, f.Values)
+}
+
+func TestAndFilters(t *testing.T) {
+	t.Parallel()
+
+	sev := SeverityFilter([]string{"error"})
+	app := AppNameFilter("gorouter")
+
+	// All nil → nil.
+	assert.Nil(t, AndFilters(nil, nil))
+
+	// A single non-nil filter is returned as-is (no wrapping AND).
+	only := AndFilters(nil, app)
+	require.NotNil(t, only)
+	assert.Equal(t, "appname", only.Field)
+	assert.Empty(t, only.And)
+
+	// Two non-nil filters → an AND composition preserving order.
+	both := AndFilters(sev, app)
+	require.NotNil(t, both)
+	require.Len(t, both.And, 2)
+	assert.Equal(t, "severity", both.And[0].Field)
+	assert.Equal(t, "appname", both.And[1].Field)
+	assert.Equal(t, "CONTAINS", both.And[1].Operator)
+}
+
+func TestStreamLogs_SendsAppNameFilter(t *testing.T) {
+	t.Parallel()
+
+	var capturedInput map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == TokenEndpoint {
+			mockAuthEndpoint(w)
+			return
+		}
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		vars, _ := body["variables"].(map[string]any)
+		capturedInput, _ = vars["INPUT"].(map[string]any)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":{"observabilityQuery":{"queryLogs":{"pageInfo":{"hasNextPage":false,"endCursor":""},"logRecords":[]}}}}`))
+	}))
+	defer server.Close()
+
+	client, err := GetAccessToken("user", "pass", server.URL, true)
+	require.NoError(t, err)
+
+	gql := NewGraphQLClient(client, server.URL, true)
+	_, err = gql.QueryLogs(context.Background(), "entity-1", LogInput{
+		Namespace:   "logs",
+		QueryFilter: AndFilters(SeverityFilter([]string{"error"}), AppNameFilter("gorouter")),
+	}, 0)
+	require.NoError(t, err)
+
+	// Both leaves are forwarded under an AND composition.
+	require.NotNil(t, capturedInput)
+	qf, _ := capturedInput["queryFilter"].(map[string]any)
+	require.NotNil(t, qf)
+	and, _ := qf["and"].([]any)
+	require.Len(t, and, 2)
+	sevLeaf, _ := and[0].(map[string]any)
+	assert.Equal(t, "severity", sevLeaf["field"])
+	assert.Equal(t, "EQ", sevLeaf["operator"])
+	appLeaf, _ := and[1].(map[string]any)
+	assert.Equal(t, "appname", appLeaf["field"])
+	assert.Equal(t, "CONTAINS", appLeaf["operator"])
+	assert.Equal(t, []any{"gorouter"}, appLeaf["values"])
+}

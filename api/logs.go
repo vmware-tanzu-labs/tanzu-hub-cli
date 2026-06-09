@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 )
 
@@ -136,13 +137,87 @@ type LogInput struct {
 	Namespace   string          `json:"namespace"`
 	StartTime   string          `json:"startTime,omitempty"`
 	EndTime     string          `json:"endTime,omitempty"`
+	QueryTime   *LogTimeRange   `json:"queryTime,omitempty"`
+	GroupBy     []string        `json:"groupBy,omitempty"`
+	QueryFilter *LogQueryFilter `json:"queryFilter,omitempty"`
 	SortOrder   string          `json:"sortOrder,omitempty"`
 	Aggregation *LogAggregation `json:"aggregation,omitempty"`
+}
+
+type LogTimeRange struct {
+	StartTime string `json:"startTime,omitempty"`
+	EndTime   string `json:"endTime,omitempty"`
 }
 
 type LogAggregation struct {
 	Field string `json:"field,omitempty"`
 	Type  string `json:"type"`
+}
+
+// LogQueryFilter mirrors the GraphQL QueryFilter input: a leaf
+// (field/operator/values) or a boolean composition (and/or/not).
+type LogQueryFilter struct {
+	And      []LogQueryFilter `json:"and,omitempty"`
+	Or       []LogQueryFilter `json:"or,omitempty"`
+	Not      []LogQueryFilter `json:"not,omitempty"`
+	Field    string           `json:"field,omitempty"`
+	Operator string           `json:"operator,omitempty"`
+	Values   []any            `json:"values,omitempty"`
+}
+
+// SeverityFilter builds a QueryFilter matching log records whose "severity"
+// field equals any of the given values. It returns nil when no severities are
+// supplied (i.e. no filtering).
+func SeverityFilter(severities []string) *LogQueryFilter {
+	switch len(severities) {
+	case 0:
+		return nil
+	case 1:
+		return &LogQueryFilter{Field: "severity", Operator: "EQ", Values: []any{severities[0]}}
+	default:
+		or := make([]LogQueryFilter, len(severities))
+		for i, s := range severities {
+			or[i] = LogQueryFilter{Field: "severity", Operator: "EQ", Values: []any{s}}
+		}
+		return &LogQueryFilter{Or: or}
+	}
+}
+
+// ContainsFilter builds a QueryFilter matching log records whose named field
+// contains the given substring. It returns nil when value is empty (i.e. no
+// filtering).
+func ContainsFilter(field, value string) *LogQueryFilter {
+	if value == "" {
+		return nil
+	}
+	return &LogQueryFilter{Field: field, Operator: "CONTAINS", Values: []any{value}}
+}
+
+// AppNameFilter builds a QueryFilter matching log records whose "appname" field
+// contains the given substring. It returns nil when appName is empty (i.e. no
+// filtering).
+func AppNameFilter(appName string) *LogQueryFilter {
+	return ContainsFilter("appname", appName)
+}
+
+// AndFilters combines the given filters into a single QueryFilter that matches
+// only records satisfying all of them. nil filters are ignored. It returns nil
+// when no non-nil filters remain, and the filter itself when only one remains.
+func AndFilters(filters ...*LogQueryFilter) *LogQueryFilter {
+	and := make([]LogQueryFilter, 0, len(filters))
+	for _, f := range filters {
+		if f != nil {
+			and = append(and, *f)
+		}
+	}
+	switch len(and) {
+	case 0:
+		return nil
+	case 1:
+		return &and[0]
+	default:
+		return &LogQueryFilter{And: and}
+	}
 }
 
 // Response types — graphql tags for hasura client deserialization.
@@ -162,10 +237,11 @@ type LogQueryResult struct {
 	TotalCount int
 }
 
-// logsPageSize is the number of records requested per page. The server caps
-// each response at this many records, so larger result sets are retrieved by
-// following the page cursor.
-const logsPageSize = 1000
+// logsPageSize is the number of records requested per page. The server enforces
+// a hard limit of 2000 records per request (requesting more is rejected with
+// "exceeds the permissible limit(Max: 2000 records)"), so we request the maximum
+// and retrieve larger result sets by following the page cursor.
+const logsPageSize = 2000
 
 // logPage holds a single page of results from queryLogs.
 type logPage struct {
@@ -174,20 +250,22 @@ type logPage struct {
 	endCursor   string
 }
 
-// QueryLogs fetches log records for the given entity ID using the supplied
-// LogInput, following the page cursor until all matching records are
-// retrieved. maxRecords bounds the total number of records returned; a value
-// of zero or less means fetch every record in the time window. Any supplied
-// progress callbacks are invoked after each page with the cumulative number of
-// records fetched so far.
-func (g *GraphQLClient) QueryLogs(ctx context.Context, entityID string, input LogInput, maxRecords int, progress ...func(fetched int)) (*LogQueryResult, error) {
-	var all []LogRecord
+// StreamLogs fetches log records for the given entity ID using the supplied
+// LogInput, following the page cursor until all matching records are retrieved.
+// Each page is handed to onPage as it arrives — records are never accumulated
+// in full — making it suitable for very large result sets. maxRecords bounds
+// the total number of records fetched; a value of zero or less means fetch
+// every record in the time window. Any supplied progress callbacks are invoked
+// after each page with the cumulative number of records fetched so far. It
+// returns the total number of records fetched.
+func (g *GraphQLClient) StreamLogs(ctx context.Context, entityID string, input LogInput, maxRecords int, onPage func(records []LogRecord) error, progress ...func(fetched int)) (int, error) {
+	fetched := 0
 	after := ""
 
 	for {
 		pageSize := logsPageSize
 		if maxRecords > 0 {
-			remaining := maxRecords - len(all)
+			remaining := maxRecords - fetched
 			if remaining <= 0 {
 				break
 			}
@@ -198,19 +276,41 @@ func (g *GraphQLClient) QueryLogs(ctx context.Context, entityID string, input Lo
 
 		page, err := g.queryLogsPage(ctx, entityID, input, pageSize, after)
 		if err != nil {
-			return nil, err
+			return fetched, err
 		}
 
-		all = append(all, page.records...)
-
-		for _, fn := range progress {
-			fn(len(all))
+		if len(page.records) > 0 {
+			if onPage != nil {
+				if err := onPage(page.records); err != nil {
+					return fetched, err
+				}
+			}
+			fetched += len(page.records)
+			for _, fn := range progress {
+				fn(fetched)
+			}
 		}
 
 		if !page.hasNextPage || page.endCursor == "" || len(page.records) == 0 {
 			break
 		}
 		after = page.endCursor
+	}
+
+	return fetched, nil
+}
+
+// QueryLogs is a convenience wrapper around StreamLogs that accumulates every
+// matching record into a single result. Prefer StreamLogs for large result
+// sets where holding all records in memory is undesirable.
+func (g *GraphQLClient) QueryLogs(ctx context.Context, entityID string, input LogInput, maxRecords int, progress ...func(fetched int)) (*LogQueryResult, error) {
+	var all []LogRecord
+	_, err := g.StreamLogs(ctx, entityID, input, maxRecords, func(records []LogRecord) error {
+		all = append(all, records...)
+		return nil
+	}, progress...)
+	if err != nil {
+		return nil, err
 	}
 
 	return &LogQueryResult{
@@ -243,6 +343,56 @@ func (g *GraphQLClient) GetLogCount(ctx context.Context, entityID string, input 
 	}
 
 	return 0, nil
+}
+
+// appNamesNamespace is the log namespace used for observability aggregations.
+const appNamesNamespace = "Observability"
+
+// AppNameCount pairs a distinct application name with the number of log records
+// it produced in the queried window.
+type AppNameCount struct {
+	Name  string `json:"name"  yaml:"name"`
+	Count int    `json:"count" yaml:"count"`
+}
+
+// GetAppNames returns the distinct application names that produced logs for the
+// entity within [startTime, endTime], along with each one's log record count,
+// sorted by name. It works by grouping a COUNT aggregation on the "appname"
+// field, so each result record represents one distinct app name.
+func (g *GraphQLClient) GetAppNames(ctx context.Context, entityID, startTime, endTime string) ([]AppNameCount, error) {
+	input := LogInput{
+		Namespace:   appNamesNamespace,
+		QueryTime:   &LogTimeRange{StartTime: startTime, EndTime: endTime},
+		GroupBy:     []string{"appname"},
+		SortOrder:   "DESC",
+		Aggregation: &LogAggregation{Type: "COUNT"},
+	}
+
+	page, err := g.queryLogsPage(ctx, entityID, input, logsPageSize, "")
+	if err != nil {
+		return nil, err
+	}
+
+	seen := make(map[string]bool)
+	var results []AppNameCount
+	for _, rec := range page.records {
+		fields := make(map[string]string, len(rec.Fields))
+		for _, fld := range rec.Fields {
+			fields[fld.Key] = fld.Value
+		}
+		name := fields["appname"]
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		count, _ := strconv.Atoi(fields["count"])
+		results = append(results, AppNameCount{Name: name, Count: count})
+	}
+
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].Name < results[j].Name
+	})
+	return results, nil
 }
 
 // queryLogsPage fetches a single page of log records. When after is empty the
