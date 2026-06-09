@@ -12,6 +12,7 @@ Available Commands:
   foundation      Manage foundation attachment
   help            Help about any command
   license         Managed license keys and license association
+  logs            Query and download logs
   vulnerabilities Upload vulnerability or SBOM data to Tanzu Hub
 
 Flags:

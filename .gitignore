@@ -38,3 +38,7 @@ golangci-lint
 
 __debug*
 hub.ql
+
+*.log
+*.jsonl
+*.tgz
